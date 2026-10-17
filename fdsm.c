@@ -1,5 +1,5 @@
 /*
- * fdsm_fast.c -- Fully Dynamic Subtree Mode, few-colors structure.
+ * fdsm.c -- Fully Dynamic Subtree Mode, few-colors structure.
  *
  * Drop-in public API (identical semantics to fdsm_corrected.c):
  *   fdsm_init, fdsm_update, fdsm_query, fdsm_move,
