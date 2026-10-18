@@ -1,50 +1,3 @@
-/*
- * dsm.c -- Dynamic Subtree Mode (Theorem 1 of the paper), optimized.
- *
- * Public API:
- *   int  dsm_init(int n, int C, double alpha, const int *parents, const int *colors);
- *   int  dsm_update(int v, int color);
- *   int  dsm_query(int v, int *color, int *frequency);
- *   void dsm_destroy(void);
- * Ties go to the smallest color index.
- *
- * Structure (as in the paper): colors with at least n^(1-alpha) leaves are
- * heavy, the others light; every color keeps its single-color tree (the
- * LCA-closure of its leaves) with explicit parent pointers and a search tree
- * of its leaves in DFS order; every node keeps a search tree of the light
- * colors branching at it, ordered by frequency; the tree is cut into groups
- * ("decomposition subtrees") of size O(n^alpha), and every group root keeps
- * the best light entry of its region and of its child groups.
- *
- * Changes with respect to the previous implementation:
- *  1. A node with two or more group-root children is made a group root, so
- *     a query below a non-root node visits O(n^alpha) nodes (previously the
- *     walk could iterate over Theta(n/n^alpha) group roots).
- *  2. An update repairs only the group summaries that changed, deepest
- *     first (previously every group was scanned, Theta(n) time at alpha=0).
- *  3. Group roots keep, in a flat table, the number of leaves of every heavy
- *     color below them (O(n) ints in total); a query at a group root reads
- *     its row, and a query at another node combines the counts of its region
- *     with the rows of its (few) group-root children.  Heavy colors therefore
- *     need no link-cut trees; the link-cut trees were removed altogether, the
- *     node to re-attach when a single-color tree gains a branching node is
- *     found with two search-tree lookups and one LCA query instead.
- *  4. Subtrees with few leaves are answered by scanning their leaves, which
- *     are stored contiguously in pre-order.
- *  5. The light walk of a query reads a pre-order array (16 bytes per node)
- *     instead of chasing adjacency lists; it is iterative (the old recursion
- *     overflowed the stack on deep trees at large alpha).
- *  6. The per-node light trees and the per-group summaries are repaired
- *     with value changes that stop as soon as a maximum is unchanged, instead
- *     of delete+insert pairs; a leaf no longer carries a one-node map.
- *  7. Construction-only arrays are released after construction.
- * All bounds of Theorem 1 are kept; alpha = 0 realizes Theorem 2 (O~(h)
- * updates), since an update only touches ancestors.
- *
- * Tuning (compile-time): DSM_SCAN_BASE + DSM_SCAN_PER_HEAVY * (#heavy colors)
- * leaves or fewer are scanned directly; DSM_DR_CAP group-root children at
- * most are combined by table lookups, more fall back to rank queries.
- */
 int dsm_init(int n, int C, double alpha, const int *parents, const int *colors);
 int dsm_update(int v, int color);
 int dsm_query(int v, int *color, int *frequency);
@@ -264,6 +217,19 @@ static int tpv(int r, int k) {
     return s;
 }
 
+static int tlbv(int r, int k) {
+    int s = -1;
+    while (r) {
+        if (_tp[r].k >= k) {
+            s = (int)_tp[r].mv;
+            r = _tp[r].l;
+        } else {
+            r = _tp[r].r;
+        }
+    }
+    return s;
+}
+
 static int tfindv(int r, int k) {
     while (r) {
         if (k == _tp[r].k) return (int)_tp[r].mv;
@@ -293,6 +259,13 @@ static void tco(int t) {
     tco(_tp[t].l);
     _cb[_cc++] = (int)_tp[t].mv;
     tco(_tp[t].r);
+}
+
+static void tco_pool(int t) {
+    if (!t) return;
+    tco_pool(_tp[t].l);
+    _cb[_cc++] = (int)_tp[t].mv;
+    tco_pool(_tp[t].r);
 }
 
 static int tbd_rec(int *ks, long long *vs, int l, int r) {
@@ -365,6 +338,14 @@ static int aa(int k, long long v) {
     return x;
 }
 
+static void af(int x) {
+    if (x) {
+        _atp[x].l = 0;
+        _atp[x].r = _afl;
+        _afl = x;
+    }
+}
+
 static int aht(int x) { return x ? _atp[x].h : 0; }
 
 static void apu(int x) {
@@ -375,6 +356,84 @@ static void apu(int x) {
     t->mx = t->mv;
     if (t->l && _atp[t->l].mx > t->mx) t->mx = _atp[t->l].mx;
     if (t->r && _atp[t->r].mx > t->mx) t->mx = _atp[t->r].mx;
+}
+
+static int arrot(int y) {
+    int x = _atp[y].l, z = _atp[x].r;
+    _atp[x].r = y;
+    _atp[y].l = z;
+    apu(y);
+    apu(x);
+    return x;
+}
+
+static int alrot(int x) {
+    int y = _atp[x].r, z = _atp[y].l;
+    _atp[y].l = x;
+    _atp[x].r = z;
+    apu(x);
+    apu(y);
+    return y;
+}
+
+static int abal(int x) {
+    int bf;
+    if (!x) return 0;
+    bf = aht(_atp[x].l) - aht(_atp[x].r);
+    if (bf > 1) {
+        if (aht(_atp[_atp[x].l].l) < aht(_atp[_atp[x].l].r)) _atp[x].l = alrot(_atp[x].l);
+        return arrot(x);
+    }
+    if (bf < -1) {
+        if (aht(_atp[_atp[x].r].r) < aht(_atp[_atp[x].r].l)) _atp[x].r = arrot(_atp[x].r);
+        return alrot(x);
+    }
+    return x;
+}
+
+static int ains1(int r, int nd) {
+    if (!r) return nd;
+    if (_atp[nd].k < _atp[r].k) _atp[r].l = ains1(_atp[r].l, nd);
+    else if (_atp[nd].k > _atp[r].k) _atp[r].r = ains1(_atp[r].r, nd);
+    else {
+        _atp[r].mv = _atp[nd].mv;
+        af(nd);
+        apu(r);
+        return r;
+    }
+    apu(r);
+    return abal(r);
+}
+
+static void ains(int *r, int k, long long v) { *r = ains1(*r, aa(k, v)); }
+
+static int adel1(int r, int k, int *did) {
+    if (!r) return 0;
+    if (k < _atp[r].k) _atp[r].l = adel1(_atp[r].l, k, did);
+    else if (k > _atp[r].k) _atp[r].r = adel1(_atp[r].r, k, did);
+    else {
+        *did = 1;
+        if (!_atp[r].l || !_atp[r].r) {
+            int ch = _atp[r].l ? _atp[r].l : _atp[r].r;
+            af(r);
+            return ch;
+        }
+        {
+            int s = _atp[r].r;
+            int dummy = 0;
+            while (_atp[s].l) s = _atp[s].l;
+            _atp[r].k = _atp[s].k;
+            _atp[r].mv = _atp[s].mv;
+            _atp[r].r = adel1(_atp[r].r, _atp[s].k, &dummy);
+        }
+    }
+    apu(r);
+    return abal(r);
+}
+
+static void adel(int *r, int k) {
+    int did = 0;
+    *r = adel1(*r, k, &did);
 }
 
 static int abd_rec(int *ks, long long *vs, int l, int r) {
@@ -395,33 +454,11 @@ static int abd(int *ks, long long *vs, int n) {
     return abd_rec(ks, vs, 0, n - 1);
 }
 
-/* Change the value of key k (which must be present) and repair the max
-   augmentation along the search path; stops as soon as a max is unchanged. */
-static int _a_stk[128];
-static void achg(int r, int k, long long v) {
-    int sp = 0, x = r;
-    while (x) {
-        _a_stk[sp++] = x;
-        if (k == _atp[x].k) break;
-        x = (k < _atp[x].k) ? _atp[x].l : _atp[x].r;
-    }
-    if (!x) return;
-    _atp[x].mv = v;
-    while (sp > 0) {
-        AN *t;
-        long long m;
-        x = _a_stk[--sp];
-        t = &_atp[x];
-        m = t->mv;
-        if (t->l && _atp[t->l].mx > m) m = _atp[t->l].mx;
-        if (t->r && _atp[t->r].mx > m) m = _atp[t->r].mx;
-        if (t->mx == m) break;
-        t->mx = m;
-    }
-}
-
 static int *dep;
 static struct {
+    int lc[2], lf;
+    int lz;
+    int lmx;
     int tc[2], th;
     long long tmx;
     int w, c, cnt, sd;
@@ -471,6 +508,7 @@ static int pa2(int w, int c, int cnt) {
     P[x].w = w;
     P[x].c = c;
     P[x].cnt = cnt;
+    P[x].lmx = dep[w];
     return x;
 }
 
@@ -593,9 +631,6 @@ static int lex(int *root, int k) {
 }
 
 static int *_lt_stk;
-/* Set the count of color c in the light tree rooted at root and repair the
-   max augmentation along the search path; heights are unchanged, and the
-   repair stops at the first node whose max did not change. */
 static void lt_adj(int root, int c, long long nv) {
     int sp = 0, t = root;
     while (t) {
@@ -603,16 +638,8 @@ static void lt_adj(int root, int c, long long nv) {
         if (P[t].c == c) break;
         t = (c < P[t].c) ? P[t].tc[0] : P[t].tc[1];
     }
-    if (!t) return;
-    P[t].cnt = mf(nv);
-    while (sp > 0) {
-        int x = _lt_stk[--sp];
-        long long m = menc(P[x].cnt, P[x].c);
-        if (P[x].tc[0] && P[P[x].tc[0]].tmx > m) m = P[P[x].tc[0]].tmx;
-        if (P[x].tc[1] && P[P[x].tc[1]].tmx > m) m = P[P[x].tc[1]].tmx;
-        if (P[x].tmx == m) break;
-        P[x].tmx = m;
-    }
+    if (sp > 0 && P[_lt_stk[sp - 1]].c == c) P[_lt_stk[sp - 1]].cnt = mf(nv);
+    while (sp > 0) lpu(_lt_stk[--sp]);
 }
 
 static int lt_bld_rec(int *arr, int l, int r) {
@@ -650,6 +677,153 @@ static void rt_cut(int x) {
     P[x].prv = 0;
 }
 
+static int lr(int x) {
+    int f = P[x].lf;
+    return !f || (P[f].lc[0] != x && P[f].lc[1] != x);
+}
+
+static void lpull(int x) {
+    int m;
+    if (!x) return;
+    m = dep[P[x].w];
+    if (P[x].lc[0] && P[P[x].lc[0]].lmx > m) m = P[P[x].lc[0]].lmx;
+    if (P[x].lc[1] && P[P[x].lc[1]].lmx > m) m = P[P[x].lc[1]].lmx;
+    P[x].lmx = m;
+}
+
+static void ladd_apply(int x, int delta) {
+    if (!x) return;
+    P[x].cnt += delta;
+    P[x].lz += delta;
+}
+
+static void lpush(int x) {
+    int delta;
+    if (!x || !P[x].lz) return;
+    delta = P[x].lz;
+    if (P[x].lc[0]) ladd_apply(P[x].lc[0], delta);
+    if (P[x].lc[1]) ladd_apply(P[x].lc[1], delta);
+    P[x].lz = 0;
+}
+
+static int *_lsp;
+static void lpush_path(int x) {
+    int sp = 0;
+    int y = x;
+    _lsp[sp++] = y;
+    while (!lr(y)) {
+        y = P[y].lf;
+        _lsp[sp++] = y;
+    }
+    while (sp > 0) lpush(_lsp[--sp]);
+}
+
+static void lrot(int x) {
+    int y = P[x].lf, z = P[y].lf, d = (P[y].lc[1] == x);
+    if (!lr(y)) P[z].lc[P[z].lc[1] == y] = x;
+    P[y].lc[d] = P[x].lc[d ^ 1];
+    if (P[x].lc[d ^ 1]) P[P[x].lc[d ^ 1]].lf = y;
+    P[x].lc[d ^ 1] = y;
+    P[y].lf = x;
+    P[x].lf = z;
+    lpull(y);
+    lpull(x);
+}
+
+static void lsplay(int x) {
+    lpush_path(x);
+    while (!lr(x)) {
+        int y = P[x].lf;
+        if (!lr(y)) {
+            int z = P[y].lf;
+            if ((P[z].lc[0] == y) == (P[y].lc[0] == x)) lrot(y);
+            else lrot(x);
+        }
+        lrot(x);
+    }
+}
+
+static void laccess(int x) {
+    int la = 0, y;
+    for (y = x; y; y = P[y].lf) {
+        lsplay(y);
+        lpush(y);
+        P[y].lc[1] = la;
+        lpull(y);
+        la = y;
+    }
+    lsplay(x);
+}
+
+static void llink(int x, int y) {
+    laccess(x);
+    laccess(y);
+    P[x].lf = y;
+    rt_link(x, y);
+}
+
+static void lcut(int x) {
+    laccess(x);
+    lpush(x);
+    if (P[x].lc[0]) {
+        P[P[x].lc[0]].lf = 0;
+        P[x].lc[0] = 0;
+        lpull(x);
+    }
+    rt_cut(x);
+}
+
+static void lct_init_singleton(int x) {
+    P[x].lc[0] = 0;
+    P[x].lc[1] = 0;
+    P[x].lz = 0;
+    P[x].lmx = dep[P[x].w];
+}
+
+static void lct_init_attach(int child, int parent) {
+    P[child].lf = parent;
+    rt_link(child, parent);
+}
+
+static void lpath_add_cnt(int x, int delta) {
+    if (!x) return;
+    laccess(x);
+    ladd_apply(x, delta);
+}
+
+static int lget_cnt(int x) {
+    if (!x) return 0;
+    laccess(x);
+    return P[x].cnt;
+}
+
+static int lfirst_depth_ge(int root, int d) {
+    int x = root;
+    while (x) {
+        lpush(x);
+        if (P[x].lc[0] && P[P[x].lc[0]].lmx >= d) {
+            x = P[x].lc[0];
+            continue;
+        }
+        if (dep[P[x].w] >= d) {
+            lsplay(x);
+            return x;
+        }
+        x = P[x].lc[1];
+    }
+    return 0;
+}
+
+static int *_wb;
+static int _wn;
+static void lwalk(int t) {
+    if (!t) return;
+    lpush(t);
+    lwalk(P[t].lc[0]);
+    _wb[_wn++] = t;
+    lwalk(P[t].lc[1]);
+}
+
 static int *LR;
 
 static int N, Q, nC;
@@ -659,17 +833,6 @@ static int *pa, *tin, *tout, tmr_;
 static int *tinv;
 static int *il, *col;
 static int *dlv, ndl;
-static int *pre, *sz_, *lidx, *nlv, *lpos, *lcol;   /* pre-order index, subtree size, leaf range, leaf colors in pre-order */
-static int *lst, *lcnt, lstamp;                     /* stamped counters for leaf scans */
-static int *gpos, *hq, hn;                          /* BFS position of a group; heap of affected groups */
-typedef struct { long long tmx; int grp, sz, lc, pad_; } TT;  /* per pre-order position: light max, group if DR root (else -1), subtree size, leaf color (-1 if internal) */
-static TT *tt;
-#ifndef DSM_SCAN_BASE
-#define DSM_SCAN_BASE 64
-#endif
-#ifndef DSM_SCAN_PER_HEAVY
-#define DSM_SCAN_PER_HEAVY 4
-#endif
 static int *es, *ed, *ef, eln;
 
 static void ae(int u, int v) {
@@ -683,12 +846,11 @@ static void ae(int u, int v) {
 
 static int *_ds, *_di;
 static void dfs(void) {
-    int sp = 0, pc = 0;
+    int sp = 0;
     _ds[0] = 0;
     _di[0] = hd[0];
     pa[0] = -1;
     dep[0] = 0;
-    pre[0] = pc++;
     tin[0] = tmr_++;
     tinv[tin[0]] = 0;
     ef[0] = eln;
@@ -708,7 +870,6 @@ static void dfs(void) {
             sp++;
             _ds[sp] = v;
             _di[sp] = hd[v];
-            pre[v] = pc++;
             tin[v] = tmr_++;
             tinv[tin[v]] = v;
             ef[v] = eln;
@@ -724,8 +885,7 @@ static void dfs(void) {
                 }
             }
             il[u] = leaf;
-            if (leaf) { lpos[u] = ndl; dlv[ndl++] = u; }
-            sz_[u] = pc - pre[u];
+            if (leaf) dlv[ndl++] = u;
             tout[u] = tmr_++;
             sp--;
             if (sp >= 0) {
@@ -859,18 +1019,13 @@ static void decompose(void) {
     memset(isDR, 0, N * sizeof(int));
     for (i = 0; i < poc; i++) {
         int u = _dq[i], e;
-        int drc = 0;
         _dw[u] = 1;
         for (e = hd[u]; e != -1; e = nx[e]) {
             int v = to[e];
             if (v == pa[u]) continue;
             if (!isDR[v]) _dw[u] += _dw[v];
-            else drc++;
         }
-        /* a node with two or more DR children is made DR as well, so that every
-           non-DR node has at most one DR child and a query walk below a non-DR
-           node costs O(B_sz) (the number of DR nodes at most doubles) */
-        if (_dw[u] >= B_sz || u == 0 || drc >= 2) isDR[u] = 1;
+        if (_dw[u] >= B_sz || u == 0) isDR[u] = 1;
     }
 
     nG = 0;
@@ -918,14 +1073,6 @@ static void decompose(void) {
             int gg = gq[qh++], e;
             for (e = dh_hd[gg]; e != -1; e = dh_nx[e]) gq[gqn++] = dh_to[e];
         }
-    }
-    for (i = 0; i < gqn; i++) gpos[gq[i]] = i;
-    for (i = 0; i < N; i++) {
-        tt[pre[i]].grp = isDR[i] ? gid[i] : -1;
-        tt[pre[i]].sz = sz_[i];
-        tt[pre[i]].tmx = -1;
-        tt[pre[i]].lc = il[i] ? col[i] : -1;
-        tt[pre[i]].pad_ = 0;
     }
 }
 
@@ -999,13 +1146,6 @@ static void comp_tc(int root) {
 }
 
 static int *freq, *isH, *hvl, nHv;
-/* Heavy-color counts at group roots: hct[g * hcap + j] is the number of leaves
-   of heavy color hvl[j] below the root of group g; hidx[c] is the column of
-   color c, -1 if c is light.  nG * hcap = O(n). */
-static int *hct, *hidx, hcap;
-#ifndef DSM_DR_CAP
-#define DSM_DR_CAP 16
-#endif
 static int *cL;
 static int *cT;
 static int *AP_;
@@ -1015,14 +1155,12 @@ static int *afg_, naf_, *afv_, afgen_;
 
 static int fvc(int w, int c) { return tcrng(cL[c], tin[w], tout[w] - 1); }
 
-static void maf(int w);
 static void upd_la(int w) {
-    long long nv = LR[w] ? P[LR[w]].tmx : -1;
-    TT *t = &tt[pre[w]];
-    if (t->tmx == nv) return;
-    t->tmx = nv;
-    achg(la_[gid[w]], w, nv);
-    maf(w);
+    int g = gid[w];
+    adel(&la_[g], w);
+    if (LR[w]) {
+        ains(&la_[g], w, P[LR[w]].tmx);
+    }
 }
 
 static void rlm(int g) {
@@ -1040,56 +1178,30 @@ static void maf(int w) {
     }
 }
 
-static int is_st(int c, int w) { return !(il[w] && col[w] == c); }
+static int is_st(int c, int w) { return tcrng(cL[c], tin[w], tin[w]) == 0; }
 
-/* The single-color-tree node of color c at vertex w: a leaf has at most one
-   such node (for its own color), kept in lfx; internal vertices use AP_. */
-static int *lfx;
-static int ap_find(int w, int c) { return il[w] ? ((col[w] == c) ? lfx[w] : 0) : tfindv(AP_[w], c); }
-static void ap_ins(int w, int c, int x) { if (il[w]) lfx[w] = x; else tins(&AP_[w], c, x); }
-static void ap_del(int w, int c) { if (il[w]) lfx[w] = 0; else tdel(&AP_[w], c); }
-
-/* Add delta to the count of a light color at x and at all its ancestors in
-   the single-color tree, following the explicit parent pointers (no lazy
-   values are ever pending: heavy colors keep no counts in these trees). */
 static void anc_adj_prop_light(int x, int delta) {
-    int nd;
-    for (nd = x; nd; nd = P[nd].par) {
+    int i;
+    if (!x) return;
+    laccess(x);
+    _wn = 0;
+    lwalk(P[x].lc[0]);
+    _wb[_wn++] = x;
+    for (i = 0; i < _wn; i++) {
+        int nd = _wb[i];
+        long long nv;
         P[nd].cnt += delta;
-        lt_adj(LR[P[nd].w], P[nd].c, menc(P[nd].cnt, P[nd].c));
+        nv = menc(P[nd].cnt, P[nd].c);
+        lt_adj(LR[P[nd].w], P[nd].c, nv);
         upd_la(P[nd].w);
+        maf(P[nd].w);
     }
 }
 
 static void anc_adj_prop(int x, int c, int delta) {
     if (!x) return;
-    if (!isH[c]) anc_adj_prop_light(x, delta);
-}
-
-/* add delta to the count of heavy column j at every DR ancestor of leaf v */
-static void hct_path_add(int v, int j, int delta) {
-    int g = gid[v];
-    while (g >= 0) {
-        hct[(size_t)g * hcap + j] += delta;
-        g = drp[g];
-    }
-}
-
-/* column j of a color that just became heavy: counts at every group root */
-static void hct_fill_column(int c, int j) {
-    int g;
-    for (g = 0; g < nG; g++) hct[(size_t)g * hcap + j] = fvc(groot[g], c);
-}
-
-/* remove column j (color becomes light): move the last column into it */
-static void hct_drop_column(int j) {
-    int g, last = nHv - 1;
-    if (j != last) {
-        for (g = 0; g < nG; g++) hct[(size_t)g * hcap + j] = hct[(size_t)g * hcap + last];
-        hvl[j] = hvl[last];
-        hidx[hvl[j]] = j;
-    }
-    nHv--;
+    if (isH[c]) lpath_add_cnt(x, delta);
+    else anc_adj_prop_light(x, delta);
 }
 
 static void light_rem_full(int c) {
@@ -1100,6 +1212,7 @@ static void light_rem_full(int c) {
         int w = tcb[i];
         (void)lex(&LR[w], c);
         upd_la(w);
+        maf(w);
     }
 }
 
@@ -1109,24 +1222,27 @@ static void light_add_full(int c) {
     comp_tc(cL[c]);
     for (i = 0; i < tcn; i++) {
         int w = tcb[i];
-        int x = ap_find(w, c);
+        int x = tfindv(AP_[w], c);
         if (!x) continue;
-        P[x].cnt = fvc(w, c);
+        P[x].cnt = lget_cnt(x);
         lins(&LR[w], x);
         upd_la(w);
+        maf(w);
     }
 }
 
 static void st_rem(int v, int c) {
-    int vx = ap_find(v, c);
+    int vx = tfindv(AP_[v], c);
     if (!vx) return;
     {
         int par = P[vx].par;
-        rt_cut(vx);
-        ap_del(v, c);
+        lcut(vx);
+        tdel(&AP_[v], c);
+        tdel(&cT[c], tin[v]);
         if (!isH[c]) {
             (void)lex(&LR[v], c);
             upd_la(v);
+            maf(v);
         }
         if (par) anc_adj_prop(par, c, -1);
         if (par) {
@@ -1136,21 +1252,25 @@ static void st_rem(int v, int c) {
             if (P[par].sd == 1 && is_st(c, pw)) {
                 int ch = P[par].fch;
                 int pp = P[par].par;
-                rt_cut(ch);
-                rt_cut(par);
-                if (pp) rt_link(ch, pp);
-                ap_del(pw, c);
+                lcut(ch);
+                lcut(par);
+                if (pp) llink(ch, pp);
+                tdel(&AP_[pw], c);
+                tdel(&cT[c], tin[pw]);
                 if (!isH[c]) {
                     (void)lex(&LR[pw], c);
                     upd_la(pw);
+                    maf(pw);
                 }
                 pf2(par);
             } else if (P[par].sd == 0 && is_st(c, pw)) {
-                rt_cut(par);
-                ap_del(pw, c);
+                lcut(par);
+                tdel(&AP_[pw], c);
+                tdel(&cT[c], tin[pw]);
                 if (!isH[c]) {
                     (void)lex(&LR[pw], c);
                     upd_la(pw);
+                    maf(pw);
                 }
                 pf2(par);
             }
@@ -1165,33 +1285,39 @@ static void st_add(int v, int c) {
     if (sz == 1) {
         int x = pa2(v, c, 1);
         P[x].sd = 0;
-        ap_ins(v, c, x);
+        tins(&AP_[v], c, x);
+        tins(&cT[c], tin[v], x);
         if (!isH[c]) {
             lins(&LR[v], x);
             upd_la(v);
+            maf(v);
         }
         return;
     }
     if (sz == 2) {
         int pn = tpv(cL[c], tin[v]), sn = tsv(cL[c], tin[v]);
         int other = (pn >= 0) ? pn : sn;
-        int ox = ap_find(other, c);
+        int ox = tfindv(AP_[other], c);
         int vp = lca(other, v);
         int vx = pa2(v, c, 1);
         int vpx = pa2(vp, c, 2);
         P[vx].sd = 0;
         P[vpx].sd = 2;
-        ap_ins(v, c, vx);
-        ap_ins(vp, c, vpx);
+        tins(&AP_[v], c, vx);
+        tins(&AP_[vp], c, vpx);
+        tins(&cT[c], tin[v], vx);
+        tins(&cT[c], tin[vp], vpx);
         if (!isH[c]) {
             lins(&LR[v], vx);
             upd_la(v);
+            maf(v);
             lins(&LR[vp], vpx);
             upd_la(vp);
+            maf(vp);
         }
-        rt_cut(ox);
-        rt_link(ox, vpx);
-        rt_link(vx, vpx);
+        lcut(ox);
+        llink(ox, vpx);
+        llink(vx, vpx);
         return;
     }
 
@@ -1205,50 +1331,47 @@ static void st_add(int v, int c) {
         else if (a1 >= 0) vp = a1;
         else vp = a2;
 
-        px = ap_find(vp, c);
+        px = tfindv(AP_[vp], c);
         vx = pa2(v, c, 1);
         P[vx].sd = 0;
-        ap_ins(v, c, vx);
+        tins(&AP_[v], c, vx);
+        tins(&cT[c], tin[v], vx);
         if (!isH[c]) {
             lins(&LR[v], vx);
             upd_la(v);
+            maf(v);
         }
 
         if (px) {
-            rt_link(vx, px);
+            llink(vx, px);
             P[px].sd++;
             anc_adj_prop(px, c, 1);
         } else {
             int nbr = (a1 >= 0 && a2 >= 0) ? ((dep[a1] >= dep[a2]) ? pn : sn) : ((pn >= 0) ? pn : sn);
-            int ox = ap_find(nbr, c);
+            int ox = tfindv(AP_[nbr], c);
             if (!ox) {
-                ap_del(v, c);
+                tdel(&AP_[v], c);
+                tdel(&cT[c], tin[v]);
                 if (!isH[c]) {
                     (void)lex(&LR[v], c);
                     upd_la(v);
+                    maf(v);
                 }
                 pf2(vx);
                 return;
             }
             {
-                int xi, yi, vpc, vpx, f, l, lw;
-                /* vp is not in T_c, so the c-leaves below vp other than v all lie
-                   in one child subtree of vp, on nbr's side of v; the topmost
-                   T_c node there is the LCA of the first and last of them */
-                if (nbr == pn) {
-                    f = tsv(cL[c], tin[vp] - 1);
-                    l = pn;
-                } else {
-                    f = sn;
-                    l = tpv(cL[c], tout[vp]);
-                }
-                lw = (f == l) ? f : lca(f, l);
-                xi = ap_find(lw, c);
+                int xi;
+                int yi, vpc, vpx;
+                laccess(ox);
+                xi = lfirst_depth_ge(ox, dep[vp]);
                 if (!xi) {
-                    ap_del(v, c);
+                    tdel(&AP_[v], c);
+                    tdel(&cT[c], tin[v]);
                     if (!isH[c]) {
                         (void)lex(&LR[v], c);
                         upd_la(v);
+                        maf(v);
                     }
                     pf2(vx);
                     return;
@@ -1257,15 +1380,17 @@ static void st_add(int v, int c) {
                 vpc = fvc(vp, c);
                 vpx = pa2(vp, c, vpc);
                 P[vpx].sd = 2;
-                ap_ins(vp, c, vpx);
+                tins(&AP_[vp], c, vpx);
+                tins(&cT[c], tin[vp], vpx);
                 if (!isH[c]) {
                     lins(&LR[vp], vpx);
                     upd_la(vp);
+                    maf(vp);
                 }
-                rt_cut(xi);
-                rt_link(xi, vpx);
-                rt_link(vx, vpx);
-                if (yi) rt_link(vpx, yi);
+                lcut(xi);
+                llink(xi, vpx);
+                llink(vx, vpx);
+                if (yi) llink(vpx, yi);
                 if (yi) anc_adj_prop(yi, c, 1);
             }
         }
@@ -1284,6 +1409,9 @@ static void dsm_build(void) {
     int *ar_nxt;
     int *lr_head = (int *)xcalloc((size_t)N, sizeof(int));
     int *lr_nxt;
+    int *ct_head = (int *)xcalloc((size_t)nC, sizeof(int));
+    int *ct_tail = (int *)xcalloc((size_t)nC, sizeof(int));
+    int *ct_nxt = NULL;
     int *ltb = (int *)xmalloc((size_t)N * sizeof(int));
     int *apb = (int *)xmalloc((size_t)N * sizeof(int));
     int *mp2 = (int *)xmalloc((size_t)N * sizeof(int));
@@ -1299,32 +1427,14 @@ static void dsm_build(void) {
     for (v = 0; v < N; v++) if (il[v] && col[v] >= 0 && col[v] < nC) freq[col[v]]++;
     nHv = 0;
     memset(isH, 0, nC * sizeof(int));
-    for (c = 0; c < nC; c++) {
-        hidx[c] = -1;
-        if (freq[c] >= thr) {
-            isH[c] = 1;
-            hidx[c] = nHv;
-            hvl[nHv++] = c;
-        }
+    for (c = 0; c < nC; c++) if (freq[c] >= thr) {
+        isH[c] = 1;
+        hvl[nHv++] = c;
     }
     decompose();
-    /* the adjacency lists, DFS stacks, and inverse DFS numbering are no longer needed */
-    free(hd); free(nx); free(to); free(tinv); free(_dw); free(_dq); free(_ds); free(_di); free(pa);
-    hd = nx = to = tinv = _dw = _dq = _ds = _di = pa = NULL;
-    hcap = (ndl / thr) + 2;
-    if (hcap < nHv) hcap = nHv;
-    hct = (int *)xcalloc((size_t)nG * (size_t)hcap, sizeof(int));
-    for (i = 0; i < ndl; i++) {
-        int j = hidx[col[dlv[i]]];
-        if (j >= 0) hct[(size_t)gid[dlv[i]] * hcap + j]++;
-    }
-    for (i = gqn - 1; i > 0; i--) {
-        int g = gq[i], pg = drp[g], j;
-        int *src = hct + (size_t)g * hcap, *dst = hct + (size_t)pg * hcap;
-        for (j = 0; j < nHv; j++) dst[j] += src[j];
-    }
 
     memset(cL, 0, (size_t)nC * sizeof(int));
+    memset(cT, 0, (size_t)nC * sizeof(int));
     for (i = 0; i < ndl; i++) {
         int c2 = col[dlv[i]];
         if (c2 >= 0 && c2 < nC) bc[c2]++;
@@ -1370,6 +1480,7 @@ static void dsm_build(void) {
                 nxt_cap = nc;
             }
             P[x].sd = tcd[i];
+            lct_init_singleton(x);
             mp2[w] = x;
             ar_nxt[x] = ar_head[w];
             ar_head[w] = x;
@@ -1381,7 +1492,7 @@ static void dsm_build(void) {
         for (i = 0; i < tcn; i++) {
             int pw = tcp[i];
             if (pw < 0) continue;
-            rt_link(mp2[tcb[i]], mp2[pw]);
+            lct_init_attach(mp2[tcb[i]], mp2[pw]);
         }
     }
 
@@ -1389,10 +1500,6 @@ static void dsm_build(void) {
         int acnt = 0, lcnt = 0, x;
         for (x = ar_head[w]; x; x = ar_nxt[x]) apb[acnt++] = x;
         AP_[w] = 0;
-        if (il[w]) {
-            lfx[w] = acnt ? apb[0] : 0;
-            acnt = 0;
-        }
         if (acnt > 0) {
             int j;
             for (j = 0; j < acnt; j++) {
@@ -1405,6 +1512,34 @@ static void dsm_build(void) {
         LR[w] = lt_bld(ltb, lcnt);
     }
 
+    ct_nxt = (int *)xmalloc((size_t)(pn_ > 1 ? pn_ : 1) * sizeof(int));
+    for (i = 0; i < tmr_; i++) {
+        int ww = tinv[i];
+        if (ww < 0) continue;
+        _cc = 0;
+        tco_pool(AP_[ww]);
+        for (w = 0; w < _cc; w++) {
+            int px = _cb[w];
+            int cc = P[px].c;
+            ct_nxt[px] = 0;
+            if (!ct_head[cc]) ct_head[cc] = px;
+            else ct_nxt[ct_tail[cc]] = px;
+            ct_tail[cc] = px;
+        }
+    }
+
+    for (c = 0; c < nC; c++) {
+        int cnt = 0, x;
+        for (x = ct_head[c]; x; x = ct_nxt[x]) apb[cnt++] = x;
+        if (cnt > 0) {
+            int j;
+            for (j = 0; j < cnt; j++) {
+                bk[j] = tin[P[apb[j]].w];
+                bv[j] = apb[j];
+            }
+            cT[c] = tbd(bk, bv, cnt);
+        }
+    }
 
     for (i = 0; i < nG; i++) {
         la_[i] = 0;
@@ -1414,17 +1549,18 @@ static void dsm_build(void) {
     {
         int *lac = (int *)xcalloc((size_t)nG, sizeof(int));
         int *las = (int *)xmalloc((size_t)nG * sizeof(int));
-        for (w = 0; w < N; w++) lac[gid[w]]++;
+        for (w = 0; w < N; w++) if (LR[w]) lac[gid[w]]++;
         las[0] = 0;
         for (i = 1; i < nG; i++) las[i] = las[i - 1] + lac[i - 1];
         memset(lac, 0, (size_t)nG * sizeof(int));
         for (w = 0; w < N; w++) {
-            int g = gid[w];
-            int idx = las[g] + lac[g]++;
-            long long tv = LR[w] ? P[LR[w]].tmx : -1;
+            int idx;
+            int g;
+            if (!LR[w]) continue;
+            g = gid[w];
+            idx = las[g] + lac[g]++;
             bk[idx] = w;
-            bv[idx] = tv;
-            tt[pre[w]].tmx = tv;
+            bv[idx] = P[LR[w]].tmx;
         }
         for (i = 0; i < nG; i++) if (lac[i] > 0) la_[i] = abd(bk + las[i], bv + las[i], lac[i]);
         xfree(lac);
@@ -1436,24 +1572,14 @@ static void dsm_build(void) {
         int cnt = 0, e;
         for (e = dh_hd[g]; e != -1; e = dh_nx[e]) {
             int cg = dh_to[e];
-            bk[cnt] = cg;
-            bv[cnt] = lm[cg];
-            cnt++;
+            if (lm[cg] >= 0) {
+                bk[cnt] = cg;
+                bv[cnt] = lm[cg];
+                cnt++;
+            }
         }
         dcc_[g] = (cnt > 0) ? abd(bk, bv, cnt) : 0;
         rlm(g);
-    }
-    for (i = 0; i < ndl; i++) lcol[i] = col[dlv[i]];
-    {
-        /* lidx[v] = number of leaves before v in pre-order, nlv[v] = leaves below v */
-        int *lpre = (int *)xcalloc((size_t)(N + 1), sizeof(int));
-        for (i = 0; i < ndl; i++) lpre[pre[dlv[i]] + 1] = 1;
-        for (i = 1; i <= N; i++) lpre[i] += lpre[i - 1];
-        for (i = 0; i < N; i++) {
-            lidx[i] = lpre[pre[i]];
-            nlv[i] = lpre[pre[i] + sz_[i]] - lpre[pre[i]];
-        }
-        xfree(lpre);
     }
 
     xfree(bk);
@@ -1465,150 +1591,60 @@ static void dsm_build(void) {
     xfree(ar_nxt);
     xfree(lr_head);
     xfree(lr_nxt);
+    xfree(ct_head);
+    xfree(ct_tail);
+    xfree(ct_nxt);
     xfree(ltb);
     xfree(apb);
     xfree(mp2);
 }
 
-static void stamp_next(void) {
-    if (lstamp == INT_MAX) {
-        memset(lst, 0, (size_t)nC * sizeof(int));
-        lstamp = 1;
-    } else {
-        lstamp++;
-    }
-}
-
-/* Walk the region of a non-DR node v in pre-order.  Returns the light maximum
-   over the region's nodes and over the groups of its DR children.  The DR
-   children are listed in drl (the first DSM_DR_CAP of them; ndrl counts all),
-   and the colors of the region's leaves are counted in lcnt under stamp lstamp. */
-static int drl[DSM_DR_CAP], ndrl;
-static long long light_scan(int v) {
-    int i = pre[v], e = i + sz_[v];
+static long long qwalk(int v, int g) {
     long long b = -1;
-    ndrl = 0;
-    stamp_next();
-    while (i < e) {
-        const TT *t = &tt[i];
-        if (t->grp >= 0) {
-            long long l2 = lm[t->grp];
+    int e;
+    if (LR[v] && P[LR[v]].tmx > b) b = P[LR[v]].tmx;
+    for (e = hd[v]; e != -1; e = nx[e]) {
+        int u = to[e];
+        if (u == pa[v]) continue;
+        if (isDR[u]) {
+            long long l2 = lm[gid[u]];
             if (l2 > b) b = l2;
-            if (ndrl < DSM_DR_CAP) drl[ndrl] = t->grp;
-            ndrl++;
-            i += t->sz;
-        } else {
-            if (t->tmx > b) b = t->tmx;
-            if (t->lc >= 0) {
-                int c = t->lc;
-                if (lst[c] != lstamp) {
-                    lst[c] = lstamp;
-                    lcnt[c] = 1;
-                } else lcnt[c]++;
-            }
-            i++;
+        } else if (gid[u] == g) {
+            long long l2 = qwalk(u, g);
+            if (l2 > b) b = l2;
         }
     }
     return b;
 }
 
 static void query_impl(int v, int *rf, int *rc) {
-    int i, L = nlv[v], bestf = 0, bestc = -1;
-    if (L <= DSM_SCAN_BASE + DSM_SCAN_PER_HEAVY * nHv) {
-        /* few leaves below v: count them directly (ties go to the smallest color) */
-        int k = lidx[v], ke = k + L;
-        stamp_next();
-        for (; k < ke; k++) {
-            int c = lcol[k], f;
-            if (lst[c] != lstamp) {
-                lst[c] = lstamp;
-                lcnt[c] = 1;
-                f = 1;
-            } else f = ++lcnt[c];
-            if (f > bestf || (f == bestf && c < bestc)) {
-                bestf = f;
-                bestc = c;
-            }
-        }
-        *rf = bestf;
-        *rc = bestc;
-        return;
-    }
+    int i;
+    long long b = -1;
     if (isDR[v]) {
-        /* light part is maintained; heavy counts are in the group's row */
-        long long b = lm[gid[v]];
-        const int *row = hct + (size_t)gid[v] * hcap;
-        if (b >= 0) {
-            bestf = mf(b);
-            bestc = mc2(b);
-        }
-        for (i = 0; i < nHv; i++) {
-            int f = row[i], c = hvl[i];
-            if (f > bestf || (f == bestf && f > 0 && c < bestc)) {
-                bestf = f;
-                bestc = c;
-            }
-        }
+        long long l2 = lm[gid[v]];
+        if (l2 > b) b = l2;
     } else {
-        long long b = light_scan(v);
-        if (b >= 0) {
-            bestf = mf(b);
-            bestc = mc2(b);
-        }
-        if (bestf < L) {
-            if (ndrl <= DSM_DR_CAP) {
-                /* region leaf counts plus the rows of the DR children */
-                for (i = 0; i < nHv; i++) {
-                    int c = hvl[i], f = (lst[c] == lstamp) ? lcnt[c] : 0, d;
-                    for (d = 0; d < ndrl; d++) f += hct[(size_t)drl[d] * hcap + i];
-                    if (f > bestf || (f == bestf && f > 0 && c < bestc)) {
-                        bestf = f;
-                        bestc = c;
-                    }
-                }
-            } else {
-                /* many DR children: rank queries on the per-color leaf trees */
-                for (i = 0; i < nHv; i++) {
-                    int c = hvl[i], fc;
-                    if (freq[c] < bestf || (freq[c] == bestf && c > bestc)) continue;
-                    fc = fvc(v, c);
-                    if (fc > bestf || (fc == bestf && fc > 0 && c < bestc)) {
-                        bestf = fc;
-                        bestc = c;
-                        if (bestf >= L) break;
-                    }
-                }
+        long long l2 = qwalk(v, gid[v]);
+        if (l2 > b) b = l2;
+    }
+    for (i = 0; i < nHv; i++) {
+        int c = hvl[i];
+        int x = tlbv(cT[c], tin[v]);
+        if (x > 0 && tin[P[x].w] < tout[v]) {
+            int fc = lget_cnt(x);
+            if (fc > 0) {
+                long long e2 = menc(fc, c);
+                if (e2 > b) b = e2;
             }
         }
     }
-    *rf = bestf;
-    *rc = bestc;
-}
-
-static void hpush(int g) {
-    int i = hn++;
-    while (i > 0) {
-        int p = (i - 1) >> 1;
-        if (gpos[hq[p]] >= gpos[g]) break;
-        hq[i] = hq[p];
-        i = p;
+    if (b < 0) {
+        *rf = 0;
+        *rc = -1;
+    } else {
+        *rf = mf(b);
+        *rc = mc2(b);
     }
-    hq[i] = g;
-}
-
-static int hpop(void) {
-    int top = hq[0], g = hq[--hn], i = 0;
-    while (1) {
-        int l = 2 * i + 1, r = l + 1, m = i;
-        int mg = g;
-        if (l < hn && gpos[hq[l]] > gpos[mg]) { m = l; mg = hq[l]; }
-        if (r < hn && gpos[hq[r]] > gpos[mg]) { m = r; mg = hq[r]; }
-        if (m == i) break;
-        hq[i] = hq[m];
-        i = m;
-    }
-    if (hn > 0) hq[i] = g;
-    return top;
 }
 
 static void update_impl(int v, int co, int cn) {
@@ -1616,59 +1652,52 @@ static void update_impl(int v, int co, int cn) {
     if (!il[v] || co == cn) return;
     who = isH[co];
     whn = isH[cn];
-    if (afgen_ == INT_MAX) {
-        memset(afv_, 0, (size_t)nG * sizeof(int));
-        afgen_ = 1;
-    } else {
-        afgen_++;
-    }
+    afgen_++;
     naf_ = 0;
 
     tdel(&cL[co], tin[v]);
     freq[co]--;
     st_rem(v, co);
-    if (who) hct_path_add(v, hidx[co], -1);
 
     nho = (freq[co] >= thr);
     if (who && !nho) {
         isH[co] = 0;
-        hct_drop_column(hidx[co]);
-        hidx[co] = -1;
+        for (i = 0; i < nHv; i++) {
+            if (hvl[i] == co) {
+                hvl[i] = hvl[--nHv];
+                break;
+            }
+        }
         if (cL[co]) light_add_full(co);
     }
 
     nhn = ((freq[cn] + 1) >= thr);
-    if (!whn && nhn) {
-        if (cL[cn]) light_rem_full(cn);
-        isH[cn] = 1;
-        hidx[cn] = nHv;
-        hvl[nHv++] = cn;
-        hct_fill_column(cn, hidx[cn]);
-    }
+    if (!whn && nhn && cL[cn]) light_rem_full(cn);
 
     col[v] = cn;
-    lcol[lpos[v]] = cn;
-    tt[pre[v]].lc = cn;
     freq[cn]++;
     tins(&cL[cn], tin[v], (long long)v);
+    if (!whn && nhn) {
+        isH[cn] = 1;
+        hvl[nHv++] = cn;
+    }
     st_add(v, cn);
-    if (isH[cn]) hct_path_add(v, hidx[cn], 1);
 
-    /* propagate changed group maxima towards the root; a max-heap on the BFS
-       position of the group processes every child group before its parent */
-    hn = 0;
-    for (i = 0; i < naf_; i++) hpush(afg_[i]);
-    while (hn > 0) {
-        int g = hpop();
-        long long old = lm[g];
-        rlm(g);
-        if (lm[g] != old) {
-            int pg = drp[g];
-            if (pg >= 0) {
-                achg(dcc_[pg], g, lm[g]);
-                if (afv_[pg] != afgen_) {
-                    afv_[pg] = afgen_;
-                    hpush(pg);
+    for (i = gqn - 1; i >= 0; i--) {
+        int g = gq[i];
+        if (afv_[g] != afgen_) continue;
+        {
+            long long old = lm[g];
+            rlm(g);
+            if (lm[g] != old) {
+                int pg = drp[g];
+                if (pg >= 0) {
+                    adel(&dcc_[pg], g);
+                    if (lm[g] >= 0) ains(&dcc_[pg], g, lm[g]);
+                    if (afv_[pg] != afgen_) {
+                        afv_[pg] = afgen_;
+                        afg_[naf_++] = pg;
+                    }
                 }
             }
         }
@@ -1707,6 +1736,8 @@ void dsm_destroy(void) {
     free(dep);
     free(P);
     free(_lt_stk);
+    free(_lsp);
+    free(_wb);
     free(LR);
     free(hd);
     free(nx);
@@ -1755,27 +1786,6 @@ void dsm_destroy(void) {
     free(lm);
     free(afg_);
     free(afv_);
-    free(pre);
-    free(sz_);
-    free(lidx);
-    free(nlv);
-    free(lpos);
-    free(lcol);
-    free(lst);
-    free(lcnt);
-    free(gpos);
-    free(hq);
-    free(tt);
-    free(hct);
-    free(hidx);
-    free(lfx);
-    lfx = NULL;
-    hct = hidx = NULL;
-    hcap = 0;
-    pre = sz_ = lidx = nlv = lpos = lcol = lst = lcnt = gpos = hq = NULL;
-    tt = NULL;
-    lstamp = 0;
-    hn = 0;
     api_ready = 0;
     MC = 0;
     _tp = NULL;
@@ -1797,6 +1807,9 @@ void dsm_destroy(void) {
     pn_ = 0;
     pfr_ = 0;
     _lt_stk = NULL;
+    _lsp = NULL;
+    _wb = NULL;
+    _wn = 0;
     LR = NULL;
     N = 0;
     Q = 0;
@@ -1891,6 +1904,8 @@ int dsm_init(int n, int C, double alpha, const int *parents, const int *colors) 
     P = xcalloc((size_t)_p_cap, sizeof(*P));
     _cb = (int *)xmalloc((size_t)N * sizeof(int));
     _lt_stk = (int *)xmalloc((size_t)N * sizeof(int));
+    _lsp = (int *)xmalloc((size_t)N * sizeof(int));
+    _wb = (int *)xmalloc((size_t)N * sizeof(int));
     LR = (int *)xcalloc((size_t)N, sizeof(int));
     hd = (int *)xmalloc((size_t)N * sizeof(int));
     nx = (int *)xmalloc((size_t)2 * (size_t)N * sizeof(int));
@@ -1936,21 +1951,6 @@ int dsm_init(int n, int C, double alpha, const int *parents, const int *colors) 
     lm = (long long *)xmalloc((size_t)N * sizeof(long long));
     afg_ = (int *)xmalloc((size_t)N * sizeof(int));
     afv_ = (int *)xcalloc((size_t)N, sizeof(int));
-    pre = (int *)xmalloc((size_t)N * sizeof(int));
-    sz_ = (int *)xmalloc((size_t)N * sizeof(int));
-    lidx = (int *)xmalloc((size_t)N * sizeof(int));
-    nlv = (int *)xmalloc((size_t)N * sizeof(int));
-    lpos = (int *)xmalloc((size_t)N * sizeof(int));
-    lcol = (int *)xmalloc((size_t)N * sizeof(int));
-    lst = (int *)xcalloc((size_t)nC, sizeof(int));
-    hidx = (int *)xmalloc((size_t)nC * sizeof(int));
-    lcnt = (int *)xmalloc((size_t)nC * sizeof(int));
-    gpos = (int *)xmalloc((size_t)N * sizeof(int));
-    hq = (int *)xmalloc((size_t)N * sizeof(int));
-    tt = (TT *)xmalloc((size_t)N * sizeof(TT));
-    lfx = (int *)xcalloc((size_t)N, sizeof(int));
-    lstamp = 0;
-    hn = 0;
 
     memset(hd, -1, (size_t)N * sizeof(int));
     memset(tinv, -1, (size_t)2 * (size_t)N * sizeof(int));
@@ -1970,10 +1970,6 @@ int dsm_init(int n, int C, double alpha, const int *parents, const int *colors) 
     dfs();
     rmq_build();
     dsm_build();
-
-    /* arrays used only during construction */
-    free(dh_to); free(dh_nx); free(dh_hd); free(gq); free(dlv);
-    dh_to = dh_nx = dh_hd = gq = dlv = NULL;
 
     api_ready = 1;
     return 0;
